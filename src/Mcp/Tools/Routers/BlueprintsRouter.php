@@ -279,6 +279,10 @@ class BlueprintsRouter extends BaseRouter
                 ->toArray();
         }
 
+        if ($formatSpec !== null && ($iconSets = $formatSpec->collectedIconSets()) !== []) {
+            $data['icon_sets'] = $iconSets;
+        }
+
         return ['blueprint' => $data];
     }
 
