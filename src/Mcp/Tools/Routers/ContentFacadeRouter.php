@@ -599,16 +599,50 @@ class ContentFacadeRouter extends BaseRouter
 
                 return $this->validateRecord(
                     $blueprint->fields(),
-                    // The slug lives outside data() but blueprints routinely mark
-                    // it required, so fold it in or every entry looks like it is
-                    // missing a required slug.
-                    ['slug' => $entry->slug(), ...$entry->data()->all()],
+                    $this->entryValidationData($entry),
                     new RecordRef(RecordType::Entry, (string) $entry->id(), $entry->locale())
                 );
             };
         }
 
         return $units;
+    }
+
+    /**
+     * The data an entry should be validated against.
+     *
+     * Not simply data(): a couple of an entry's fields live outside it while
+     * still being declared — and required — in the blueprint, so validating
+     * data() alone reports them missing on every single row.
+     *
+     * The slug is one. The date is the other: Statamic injects a required date
+     * field into a dated collection's blueprint at runtime, but the value is a
+     * filename prefix on the file driver and a column on the Eloquent one, so
+     * it never appears in data() and every dated entry failed (#57).
+     *
+     * Read the date off the entry rather than the collection — Collection has
+     * no time-related accessor at all, and reaching for one silently aborted
+     * the whole sweep on its first dated entry.
+     *
+     * @return array<string, mixed>
+     */
+    private function entryValidationData(\Statamic\Contracts\Entries\Entry $entry): array
+    {
+        $data = ['slug' => $entry->slug(), ...$entry->data()->all()];
+
+        if ($entry->hasDate()) {
+            $date = $entry->date();
+
+            if ($date !== null) {
+                // The Carbon instance, not a formatted string. Statamic's own
+                // date rule returns early for a Carbon — it treats one as
+                // already processed — so there is no format to guess at and no
+                // time_enabled config to second-guess.
+                $data['date'] = $date;
+            }
+        }
+
+        return $data;
     }
 
     /**

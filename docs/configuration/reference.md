@@ -54,6 +54,8 @@ Controls authentication enforcement, audit logging, and system hardening.
 | `security.expose_versions` | `STATAMIC_MCP_EXPOSE_VERSIONS` | `false` | Include Statamic/Laravel versions in responses |
 | `security.max_token_lifetime_days` | `STATAMIC_MCP_MAX_TOKEN_LIFETIME` | `365` | Maximum token lifetime in days |
 | `security.tool_timeout_seconds` | `STATAMIC_MCP_TOOL_TIMEOUT` | `30` | Maximum execution time per tool call |
+| `security.max_response_size` | `STATAMIC_MCP_MAX_RESPONSE_SIZE` | `100000` | Largest tool response in bytes before it is refused; `0` disables the guard |
+| `security.reject_unknown_fields` | `STATAMIC_MCP_REJECT_UNKNOWN_FIELDS` | `true` | Refuse writes carrying keys that are not field handles inside a set, grid row or group |
 
 ```php
 'security' => [
@@ -63,8 +65,33 @@ Controls authentication enforcement, audit logging, and system hardening.
     'expose_versions' => env('STATAMIC_MCP_EXPOSE_VERSIONS', false),
     'max_token_lifetime_days' => env('STATAMIC_MCP_MAX_TOKEN_LIFETIME', 365),
     'tool_timeout_seconds' => env('STATAMIC_MCP_TOOL_TIMEOUT', 30),
+    'max_response_size' => (int) env('STATAMIC_MCP_MAX_RESPONSE_SIZE', 100000),
+    'reject_unknown_fields' => env('STATAMIC_MCP_REJECT_UNKNOWN_FIELDS', true),
 ],
 ```
+
+### `max_response_size`
+
+The limit exists to protect the client's context window, not the server: the
+response has already been built by the time it is measured. The right ceiling
+therefore depends on the client, which is why it is configurable. Setting it to
+`0` disables the guard entirely — reasonable for a client with a large context,
+but a tool call can then return an arbitrarily large payload.
+
+### `reject_unknown_fields`
+
+Inside a replicator set, grid row, bard set or group, a key that is not a field
+handle is not an error to Statamic. `Replicator::processRow()` and
+`Grid::processRow()` merge the raw row back over the processed one, so the key
+is written to the content file as inert data that no template reads — and the
+write reports success. For a client that cannot read the blueprint from the
+repository, that is undiagnosable, so this refuses the write instead and names
+the valid handles at that level.
+
+The check does not apply at the top level of a record. An entry legitimately
+carries keys that are not blueprint fields — `template` and `layout` are read
+back by `Entry::template()` and `Entry::layout()`, `parent` backs structures —
+and no allowlist can enumerate what every addon adds.
 
 ## Rate Limiting
 
@@ -78,6 +105,83 @@ Controls request throttling for the web endpoint. Skipped in CLI context.
 'rate_limit' => [
     'max_attempts' => env('STATAMIC_MCP_RATE_LIMIT_MAX', 60),
 ],
+```
+
+## Cache
+
+Whether a write clears Statamic's caches — and it does, because Statamic does not rebuild
+the indexes that *depend* on a write. Change a field's `max_items` and its index keeps the
+old shape until a query throws on it; change a collection's mount and every entry 404s;
+remove a taxonomy and `whereTaxonomy()` goes on returning entries.
+
+**What changed in 3.1.0 is *when*.** The clear used to run through Artisan in the middle
+of the request, resetting the in-memory stores while the call was still using them. On a
+live multisite the tree repository returned nothing, Statamic padded the empty tree with
+every entry at root, nested URLs flattened and a random entry became the homepage. It now
+runs once the tool call is finished — the response is built, nothing further reads
+Statamic, and the next call starts fresh. Same coverage, without the mechanism that did
+the damage.
+
+```php
+'cache' => [
+    'clear_stache_after_write' => env('STATAMIC_MCP_CLEAR_STACHE_AFTER_WRITE', true),
+    'clear_static_after_write' => env('STATAMIC_MCP_CLEAR_STATIC_AFTER_WRITE', true),
+],
+```
+
+Turn either off if you would rather trade index freshness for speed on a large site and
+rely on your own invalidation rules. The `statamic-system` tool's `cache_clear` action is
+unaffected — that clear runs immediately, because it was asked for.
+
+## Resources
+
+The read-only surface: `statamic://blueprints` and friends.
+
+These have their own switch because they used to share the tools' one. A site that keeps
+its content model in Git turns the blueprints *tool* off precisely because it can create
+and delete blueprints — and that also removed the only read-only way for an agent to
+learn a blueprint's fields, while the server's own instructions tell it to read the
+blueprint before every write.
+
+```php
+'resources' => [
+    'enabled' => env('STATAMIC_MCP_RESOURCES_ENABLED', true),
+    'require_statamic_permission' => env('STATAMIC_MCP_RESOURCES_REQUIRE_PERMISSION', true),
+],
+```
+
+`require_statamic_permission` keeps the Statamic permission check (`configure fields`,
+`configure collections` or `configure taxonomies`) on top of the token scope and the
+resource-policy allowlist. Set it to `false` if your editors hold none of those and you
+would rather let the token scope you minted decide who may read schema.
+
+## Tool Catalog
+
+Controls how the tool list is presented to a client when it connects.
+
+By default the catalog is **partial**. Only the tools a session usually opens with are
+listed — `statamic-entries`, `statamic-blueprints` and `statamic-system-discover`. The
+rest are reached through `search_tools` and `execute_tools`.
+
+The reason is token cost: the full catalog is roughly 31 KB of JSON schema that every
+client loads on every connection, before it has asked anything. Withholding the less-used
+tools cuts that to about 12.6 KB — a ~60% saving in the client's context window.
+
+Nothing is taken away. The hidden tools are fully available and fully gated — token
+scopes, resource policy, Statamic permissions and the confirmation gate all apply
+exactly as they do on a direct call. Only their schemas wait until a client asks.
+
+```php
+'catalog' => [
+    'searchable' => env('STATAMIC_MCP_SEARCHABLE_CATALOG', true),
+],
+```
+
+Set it to `false` if your MCP client handles `search_tools` poorly and you would rather
+it saw every tool listed directly:
+
+```env
+STATAMIC_MCP_SEARCHABLE_CATALOG=false
 ```
 
 ## Tool Domains
@@ -195,9 +299,27 @@ STATAMIC_MCP_EXPOSE_VERSIONS=false
 STATAMIC_MCP_MAX_UPLOAD_SIZE=10485760
 STATAMIC_MCP_MAX_TOKEN_LIFETIME=365
 STATAMIC_MCP_TOOL_TIMEOUT=30
+STATAMIC_MCP_MAX_RESPONSE_SIZE=100000
+STATAMIC_MCP_REJECT_UNKNOWN_FIELDS=true
+
+# Confirmation flow
+# Unset auto-detects: on in production, off in local/dev/testing
+STATAMIC_MCP_CONFIRMATION_ENABLED=
+STATAMIC_MCP_CONFIRMATION_TTL=300
 
 # Rate limiting
 STATAMIC_MCP_RATE_LIMIT_MAX=60
+
+# Tool catalog
+STATAMIC_MCP_SEARCHABLE_CATALOG=true
+
+# Cache
+STATAMIC_MCP_CLEAR_STACHE_AFTER_WRITE=false
+STATAMIC_MCP_CLEAR_STATIC_AFTER_WRITE=true
+
+# Resources
+STATAMIC_MCP_RESOURCES_ENABLED=true
+STATAMIC_MCP_RESOURCES_REQUIRE_PERMISSION=true
 
 # OAuth 2.1
 STATAMIC_MCP_OAUTH_ENABLED=true
@@ -209,6 +331,13 @@ STATAMIC_MCP_OAUTH_REFRESH_TOKEN_TTL=2592000
 STATAMIC_MCP_OAUTH_DEFAULT_SCOPES=*
 STATAMIC_MCP_OAUTH_MAX_CLIENTS=50
 STATAMIC_MCP_OAUTH_MAX_CLIENTS_PER_IP=5
+
+# OAuth: Client ID Metadata Documents
+STATAMIC_MCP_OAUTH_CIMD_ENABLED=true
+STATAMIC_MCP_OAUTH_CIMD_FETCH_TIMEOUT=5
+STATAMIC_MCP_OAUTH_CIMD_MAX_RESPONSE_SIZE=5120
+STATAMIC_MCP_OAUTH_CIMD_CACHE_TTL=3600
+STATAMIC_MCP_OAUTH_CIMD_BLOCK_PRIVATE_IPS=true
 
 # Tool toggles (set to false to disable)
 STATAMIC_MCP_TOOL_BLUEPRINTS_ENABLED=true

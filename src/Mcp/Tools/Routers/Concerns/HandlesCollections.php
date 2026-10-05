@@ -190,8 +190,13 @@ trait HandlesCollections
 
             $collection->save();
 
+            // CollectionSaved does not reach Statamic's static-cache
+            // invalidator, so a template or layout change would otherwise leave
+            // cached entry pages serving the old output.
+            $this->invalidateStaticCache($collection);
+
             // Clear caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             return [
                 'collection' => [
@@ -246,8 +251,13 @@ trait HandlesCollections
 
             $collection->save();
 
+            // CollectionSaved does not reach Statamic's static-cache
+            // invalidator, so a template or layout change would otherwise leave
+            // cached entry pages serving the old output.
+            $this->invalidateStaticCache($collection);
+
             // Clear caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             return [
                 'collection' => [
@@ -303,7 +313,7 @@ trait HandlesCollections
             $collection->delete();
 
             // Clear caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             return [
                 'collection' => [
@@ -384,8 +394,13 @@ trait HandlesCollections
             // Save the collection
             $collection->save();
 
+            // CollectionSaved does not reach Statamic's static-cache
+            // invalidator, so a template or layout change would otherwise leave
+            // cached entry pages serving the old output.
+            $this->invalidateStaticCache($collection);
+
             // Clear caches
-            $this->clearStatamicCaches(['stache']);
+            $this->clearCachesAfterWrite(['stache']);
 
             return [
                 'collection' => [

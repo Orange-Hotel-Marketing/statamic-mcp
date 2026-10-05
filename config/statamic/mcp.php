@@ -108,16 +108,18 @@ return [
 
         'tool_timeout_seconds' => env('STATAMIC_MCP_TOOL_TIMEOUT', 30),
 
-        // Reject writes carrying keys that are not field handles. Statamic
-        // discards them at the top level and stores them as inert data inside
-        // replicator, grid and bard sets, so an invented handle otherwise
-        // reports success while producing content that does not match.
-        'reject_unknown_fields' => env('STATAMIC_MCP_REJECT_UNKNOWN_FIELDS', true),
-
         // Largest tool response, in bytes, before it is refused as too large.
         // The limit exists to protect the client's context window, so the right
         // value depends on the client; 0 disables the guard entirely.
         'max_response_size' => (int) env('STATAMIC_MCP_MAX_RESPONSE_SIZE', 100000),
+
+        // Reject writes carrying keys that are not field handles inside a
+        // replicator set, grid row, bard set or group. Statamic stores them as
+        // inert data no template reads, so an invented handle otherwise reports
+        // success while producing content that does not match. Not applied at
+        // the top level of a record, where non-blueprint keys such as template,
+        // layout and parent are legitimate.
+        'reject_unknown_fields' => env('STATAMIC_MCP_REJECT_UNKNOWN_FIELDS', true),
     ],
 
     /*
@@ -143,13 +145,13 @@ return [
         | the gate for that domain. The '*' wildcard gates every action.
         |
         | Defaults preserve historical behaviour: 'delete' everywhere plus
-        | create/update on blueprints, and destructive revision actions on
+        | create/generate/update on blueprints, and destructive revision actions on
         | entries. Operators can widen the gate per domain — e.g. require
         | confirmation on entries.update — without forking the package.
         */
         'actions' => [
             'default' => ['delete'],
-            'blueprints' => ['create', 'update', 'delete'],
+            'blueprints' => ['create', 'generate', 'update', 'delete'],
             'entries' => ['delete', 'restore_revision', 'publish_working_copy'],
             // 'entries' => ['create', 'update', 'delete', 'publish', 'unpublish', 'restore_revision', 'publish_working_copy'],
             // 'globals' => ['update'],
@@ -198,6 +200,86 @@ return [
         'cimd_max_response_size' => (int) env('STATAMIC_MCP_OAUTH_CIMD_MAX_RESPONSE_SIZE', 5120),
         'cimd_cache_ttl' => (int) env('STATAMIC_MCP_OAUTH_CIMD_CACHE_TTL', 3600),
         'cimd_block_private_ips' => env('STATAMIC_MCP_OAUTH_CIMD_BLOCK_PRIVATE_IPS', true),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Resources
+    |--------------------------------------------------------------------------
+    |
+    | The read-only surface: statamic://blueprints and friends.
+    |
+    | These have their own switch because they used to share the tools' one. A
+    | site that keeps its content model in Git turns the blueprints *tool* off
+    | precisely because it can create and delete blueprints — and that also
+    | removed the only read-only way for an agent to learn a blueprint's
+    | fields, while the server's own instructions tell it to read the blueprint
+    | before every write (issue #54).
+    |
+    | 'require_statamic_permission' keeps the Statamic permission check on top
+    | of the token scope and the resource-policy allowlist. Set it to false if
+    | your editors hold no 'configure fields' permission and you would rather
+    | let the token scope you minted decide who may read schema.
+    |
+    | Not to be confused with the per-domain `tools.*.resources` allowlists
+    | further down, which are the resource *policy* — which handles a token may
+    | touch. This block is about the MCP resource surface itself.
+    |
+    */
+    'resources' => [
+        'enabled' => env('STATAMIC_MCP_RESOURCES_ENABLED', true),
+        'require_statamic_permission' => env('STATAMIC_MCP_RESOURCES_REQUIRE_PERMISSION', true),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Cache
+    |--------------------------------------------------------------------------
+    |
+    | Whether a write clears Statamic's caches, and it does — because Statamic
+    | does not rebuild the indexes that DEPEND on a write. Change a field's
+    | max_items and its index keeps the old shape until a query throws on it;
+    | change a collection's mount and every entry 404s; remove a taxonomy and
+    | whereTaxonomy() goes on returning entries. That list is long and version
+    | dependent, so it is not worth enumerating by hand.
+    |
+    | What changed in 3.1.0 is WHEN. The clear used to run through Artisan in
+    | the middle of the request, resetting the in-memory stores while the call
+    | was still using them: on a live multisite the tree repository returned
+    | nothing, Statamic padded the empty tree with every entry at root, and a
+    | random entry became the homepage (issue #53). It now runs once the tool
+    | call is finished, when the response is built and nothing further reads
+    | Statamic — same coverage, without the mechanism that did the damage.
+    |
+    | Turn either off if you would rather trade index freshness for speed on a
+    | large site, and rely on your own invalidation rules.
+    |
+    */
+    'cache' => [
+        'clear_stache_after_write' => env('STATAMIC_MCP_CLEAR_STACHE_AFTER_WRITE', true),
+        'clear_static_after_write' => env('STATAMIC_MCP_CLEAR_STATIC_AFTER_WRITE', true),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Tool Catalog
+    |--------------------------------------------------------------------------
+    |
+    | How the tool list is presented to clients at connect time.
+    |
+    | With 'searchable' on, only the tools a session usually opens with are
+    | listed — entries, blueprints and discovery. The rest are reached through
+    | search_tools and execute_tools. The full catalog is ~31 KB of schema that
+    | every client pays for on every connection before it has asked anything;
+    | withholding the rest cuts that by about 60%. They stay fully available and
+    | fully gated — only their schemas wait until a client asks for them.
+    |
+    | Turn it off if your MCP client handles search_tools poorly and you would
+    | rather it saw every tool listed directly.
+    |
+    */
+    'catalog' => [
+        'searchable' => env('STATAMIC_MCP_SEARCHABLE_CATALOG', true),
     ],
 
     /*

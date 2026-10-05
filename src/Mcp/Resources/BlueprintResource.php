@@ -6,9 +6,11 @@ namespace Cboxdk\StatamicMcp\Mcp\Resources;
 
 use Cboxdk\StatamicMcp\Mcp\Resources\Concerns\AuthorizesResourceAccess;
 use Cboxdk\StatamicMcp\Mcp\Resources\Concerns\LocatesBlueprints;
+use Laravel\Mcp\Enums\CacheScope;
 use Laravel\Mcp\Request;
 use Laravel\Mcp\Response;
 use Laravel\Mcp\ResponseFactory;
+use Laravel\Mcp\Server\Attributes\Cacheable;
 use Laravel\Mcp\Server\Attributes\Description;
 use Laravel\Mcp\Server\Attributes\MimeType;
 use Laravel\Mcp\Server\Attributes\Name;
@@ -24,11 +26,21 @@ use Statamic\Fields\Field;
  * Lets a client read the schema it needs to shape a write without spending a
  * tool call — the same data statamic-blueprints get returns, behind the same
  * authorization gates.
+ *
+ * Blueprints change when a developer changes them, not during a session, so a
+ * short reuse window saves the repeated reads a single turn makes while
+ * shaping a write. It is deliberately short rather than generous: this addon
+ * can itself edit a blueprint, and an agent holding a stale schema across its
+ * own edit is the one failure this hint could cause.
+ *
+ * Private scope is required, not merely cautious — the body is filtered by the
+ * caller's resource policy and Statamic permissions.
  */
 #[Name('statamic-blueprint')]
 #[Title('Statamic Blueprint')]
 #[Description('A single blueprint\'s fields, by namespace and handle. Browse statamic://blueprints for the available URIs.')]
 #[MimeType('application/json')]
+#[Cacheable(ttlMs: 60_000, scope: CacheScope::Private)]
 class BlueprintResource extends Resource implements HasUriTemplate
 {
     use AuthorizesResourceAccess;
@@ -50,17 +62,17 @@ class BlueprintResource extends Resource implements HasUriTemplate
         $handle = $request->get('handle');
 
         if (! is_string($namespace) || ! is_string($handle) || $namespace === '' || $handle === '') {
-            return Response::error('A blueprint URI must be statamic://blueprints/{namespace}/{handle}.');
+            return $this->refusal('A blueprint URI must be statamic://blueprints/{namespace}/{handle}.', 'INVALID_URI');
         }
 
         if ($reason = $this->denyReason($handle)) {
-            return Response::error("Permission denied: {$reason}");
+            return $this->refusal("Permission denied: {$reason}", 'PERMISSION_DENIED');
         }
 
         $blueprint = $this->findBlueprint($namespace, $handle);
 
         if ($blueprint === null) {
-            return Response::error("Blueprint not found: {$namespace}/{$handle}");
+            return $this->refusal("Blueprint not found: {$namespace}/{$handle}", 'NOT_FOUND');
         }
 
         return Response::json([

@@ -6,7 +6,6 @@ namespace Cboxdk\StatamicMcp\Mcp\Tools\Routers;
 
 use Cboxdk\StatamicMcp\Mcp\Support\FieldFormatSpec;
 use Cboxdk\StatamicMcp\Mcp\Tools\BaseRouter;
-use Cboxdk\StatamicMcp\Mcp\Tools\Concerns\ClearsCaches;
 use Illuminate\Contracts\JsonSchema\JsonSchema as JsonSchemaContract;
 use Illuminate\JsonSchema\JsonSchema;
 use Illuminate\Support\Collection as SupportCollection;
@@ -30,8 +29,6 @@ use Statamic\Fieldtypes\Replicator;
 #[Description('Manage Statamic blueprints — the schema definitions for all content types. Call get before creating/updating entries, terms, or globals to understand required fields AND the _format_spec for each field (wire format, allowed types, common mistakes). Actions: list, get, create, update, delete, scan, generate, types, validate.')]
 class BlueprintsRouter extends BaseRouter
 {
-    use ClearsCaches;
-
     protected function getDomain(): string
     {
         return 'blueprints';
@@ -237,6 +234,7 @@ class BlueprintsRouter extends BaseRouter
 
         foreach (explode('.', $path) as $segment) {
             if ($field !== null) {
+                $parentIsSetHolder = $field->fieldtype() instanceof Replicator;
                 $next = $this->childFields($field, $segment);
 
                 if ($next === null) {
@@ -244,12 +242,14 @@ class BlueprintsRouter extends BaseRouter
                 }
 
                 $fields = $next;
-                $field = $fields->count() === 1 && $fields->has($segment) ? $fields->get($segment) : null;
 
-                // A set handle resolves to a collection of fields, not a field.
-                if ($field === null && $fields->has($segment)) {
-                    $field = $fields->get($segment);
-                }
+                // What the segment named depends on the parent. On a replicator
+                // or bard it is a set handle, which resolves to that set's whole
+                // field collection; on a group or grid it is one inner field.
+                // Reading it off the resolved collection instead would mistake a
+                // set for a field whenever a set contains a field of the same
+                // handle.
+                $field = $parentIsSetHolder ? null : $fields->get($segment);
 
                 $walked[] = $segment;
 
@@ -277,10 +277,6 @@ class BlueprintsRouter extends BaseRouter
             $data['fields'] = $fields
                 ->map(fn (mixed $f): array => $this->describeField($f, $includeConfig, $formatSpec))
                 ->toArray();
-        }
-
-        if ($formatSpec !== null && ($iconSets = $formatSpec->collectedIconSets()) !== []) {
-            $data['icon_sets'] = $iconSets;
         }
 
         return ['blueprint' => $data];
@@ -564,7 +560,7 @@ class BlueprintsRouter extends BaseRouter
                 $blueprint->save();
 
                 // Clear Statamic caches
-                $this->clearStatamicCaches(['stache']);
+                $this->clearCachesAfterWrite(['stache']);
 
                 return [
                     'blueprint' => [
@@ -873,7 +869,7 @@ class BlueprintsRouter extends BaseRouter
             $blueprint->save();
 
             // Clear Statamic caches
-            $this->clearStatamicCaches(['stache']);
+            $this->clearCachesAfterWrite(['stache']);
 
             return [
                 'blueprint' => [
@@ -929,7 +925,7 @@ class BlueprintsRouter extends BaseRouter
             $blueprint->delete();
 
             // Clear Statamic caches
-            $this->clearStatamicCaches(['stache']);
+            $this->clearCachesAfterWrite(['stache']);
 
             return [
                 'deleted' => true,
@@ -1027,7 +1023,7 @@ class BlueprintsRouter extends BaseRouter
             $blueprint->save();
 
             // Clear Statamic caches
-            $this->clearStatamicCaches(['stache']);
+            $this->clearCachesAfterWrite(['stache']);
 
             return [
                 'blueprint' => [

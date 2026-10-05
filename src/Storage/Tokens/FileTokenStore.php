@@ -182,6 +182,8 @@ class FileTokenStore extends BaseTokenStore implements TokenStore
     public function deleteForUser(string $userId): int
     {
         $deleted = 0;
+        /** @var list<string> $removedHashes */
+        $removedHashes = [];
 
         foreach ($this->scanAllTokens() as $data) {
             if (($data['user_id'] ?? '') === $userId) {
@@ -193,10 +195,12 @@ class FileTokenStore extends BaseTokenStore implements TokenStore
                     unlink($filePath);
                 }
 
-                $this->removeFromIndex($hash);
+                $removedHashes[] = $hash;
                 $deleted++;
             }
         }
+
+        $this->removeManyFromIndex($removedHashes);
 
         return $deleted;
     }
@@ -247,6 +251,8 @@ class FileTokenStore extends BaseTokenStore implements TokenStore
     public function pruneExpired(): int
     {
         $pruned = 0;
+        /** @var list<string> $removedHashes */
+        $removedHashes = [];
 
         foreach ($this->scanAllTokens() as $data) {
             $expiresAt = $data['expires_at'] ?? null;
@@ -270,10 +276,12 @@ class FileTokenStore extends BaseTokenStore implements TokenStore
                     unlink($filePath);
                 }
 
-                $this->removeFromIndex($hash);
+                $removedHashes[] = $hash;
                 $pruned++;
             }
         }
+
+        $this->removeManyFromIndex($removedHashes);
 
         return $pruned;
     }
@@ -412,7 +420,32 @@ class FileTokenStore extends BaseTokenStore implements TokenStore
 
     private function removeFromIndex(string $hash): void
     {
-        if ($hash === '') {
+        $this->removeManyFromIndex([$hash]);
+    }
+
+    /**
+     * Drop several hashes from the index in a single locked read-modify-write.
+     *
+     * Removing them one at a time re-read, re-encoded and rewrote the whole
+     * index per token, so pruning or deleting n tokens wrote on the order of
+     * n^2 bytes. On a large token store that dominated the cost of the
+     * operation, and it is what made the prune scaling test intermittently
+     * exceed its linear-ish budget on slower disks.
+     *
+     * Callers unlink the token files first and remove the hashes once at the
+     * end, so a failure part-way through can leave index entries whose file is
+     * already gone. That is benign: findByHash() resolves an entry through
+     * find(), which requires the file, so a deleted token can never be
+     * authenticated by a stale entry, and rebuildIndex() drops it on the next
+     * miss.
+     *
+     * @param  list<string>  $hashes
+     */
+    private function removeManyFromIndex(array $hashes): void
+    {
+        $hashes = array_values(array_filter($hashes, static fn (string $hash): bool => $hash !== ''));
+
+        if ($hashes === []) {
             return;
         }
 
@@ -442,7 +475,10 @@ class FileTokenStore extends BaseTokenStore implements TokenStore
 
         /** @var array<string, string> $index */
         $index = ($content !== '') ? (json_decode($content, true) ?? []) : [];
-        unset($index[$hash]);
+
+        foreach ($hashes as $hash) {
+            unset($index[$hash]);
+        }
 
         ftruncate($handle, 0);
         rewind($handle);
@@ -495,10 +531,22 @@ class FileTokenStore extends BaseTokenStore implements TokenStore
     private function scanAllTokens(): array
     {
         $tokens = [];
-        $files = glob($this->storagePath . '/*.yaml');
 
-        if ($files === false) {
+        // scandir() rather than glob(): glob() bypasses stream wrappers
+        // entirely, which silently returns nothing when the store is pointed at
+        // a wrapped path. Same ordering (both sort ascending), same result.
+        $entries = @scandir($this->storagePath);
+
+        if ($entries === false) {
             return [];
+        }
+
+        $files = [];
+
+        foreach ($entries as $entry) {
+            if (str_ends_with($entry, '.yaml')) {
+                $files[] = $this->storagePath . '/' . $entry;
+            }
         }
 
         foreach ($files as $file) {

@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Cboxdk\StatamicMcp\Mcp\Tools\Routers;
 
 use Cboxdk\StatamicMcp\Mcp\Tools\BaseRouter;
-use Cboxdk\StatamicMcp\Mcp\Tools\Concerns\ClearsCaches;
 use Cboxdk\StatamicMcp\Mcp\Tools\Concerns\NormalizesDateFields;
 use Cboxdk\StatamicMcp\Mcp\Tools\Concerns\SanitizesFieldData;
 use Illuminate\Contracts\JsonSchema\JsonSchema as JsonSchemaContract;
@@ -26,7 +25,6 @@ use Statamic\Support\Str;
 #[Description('Manage Statamic taxonomy terms. Use statamic-blueprints get first to understand field structure before create/update. Actions: list, get, create, update, delete.')]
 class TermsRouter extends BaseRouter
 {
-    use ClearsCaches;
     use NormalizesDateFields;
     use SanitizesFieldData;
 
@@ -383,7 +381,7 @@ class TermsRouter extends BaseRouter
             $term->save();
 
             // Clear relevant caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             return [
                 'term' => [
@@ -518,7 +516,7 @@ class TermsRouter extends BaseRouter
             $term->merge($validatedData)->save();
 
             // Clear relevant caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             return [
                 'term' => [
@@ -584,7 +582,7 @@ class TermsRouter extends BaseRouter
             $term->delete();
 
             // Clear relevant caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             return [
                 'term' => $termData,

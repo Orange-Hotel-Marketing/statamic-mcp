@@ -201,28 +201,53 @@ it('returns null for unknown fieldtypes so the response stays small', function (
     expect($spec)->toBeNull();
 });
 
-it('describes the link fieldtype using the references ResolveRedirect actually understands', function (): void {
-    $spec = (new FieldFormatSpec)->for(makeField('link'));
+it('reads options written as a list of key/value maps', function (): void {
+    // What the Control Panel writes, and what selectSpec used to drop entirely.
+    $spec = (new FieldFormatSpec)->for(makeField('select', ['options' => [
+        ['key' => 'solid', 'value' => 'Solid Header'],
+        ['key' => 'transparent', 'value' => 'Transparent Header'],
+    ]]));
 
-    expect($spec['wire_format'])->toBe('string');
-    expect($spec['shape'])->toBe('url_or_reference');
-
-    $rules = implode(' ', $spec['rules']);
-    expect($rules)->toContain('entry::<entry-id>');
-    expect($rules)->toContain('asset::<container>::<path>');
-    expect($rules)->toContain('@child');
-
-    expect($spec['examples'])->toContain('entry::3f2b1a44-0c6e-4c3a-9f1e-8b5d6c7a2e10');
-    expect($spec['examples'])->toContain('asset::images::brochures/2026.pdf');
+    expect($spec['allowed_values'])->toBe(['solid', 'transparent']);
 });
 
-it('warns against the statamic:// scheme in a link field', function (): void {
-    $spec = (new FieldFormatSpec)->for(makeField('link'));
+it('reads options written as a key to label map', function (): void {
+    $spec = (new FieldFormatSpec)->for(makeField('button_group', ['options' => [
+        'grid' => 'Grid',
+        'carousel' => 'Carousel',
+    ]]));
 
-    // Bard link marks use statamic://; ResolveRedirect (the link fieldtype)
-    // does not, and stores an unresolvable value verbatim.
-    expect(implode(' ', $spec['rules']))->toContain('statamic://');
-    expect(implode(' ', $spec['common_mistakes']))->toContain('statamic://entry/<uuid>');
+    expect($spec['allowed_values'])->toBe(['grid', 'carousel']);
+});
+
+it('reads options written as a flat list', function (): void {
+    $spec = (new FieldFormatSpec)->for(makeField('radio', ['options' => ['left', 'center']]));
+
+    expect($spec['allowed_values'])->toBe(['left', 'center']);
+});
+
+it('casts non-string option keys to strings', function (): void {
+    $spec = (new FieldFormatSpec)->for(makeField('select', ['options' => [
+        ['key' => 1, 'value' => 'One'],
+        ['key' => 2, 'value' => 'Two'],
+    ]]));
+
+    expect($spec['allowed_values'])->toBe(['1', '2']);
+});
+
+it('returns no allowed values when a select has no options', function (): void {
+    expect((new FieldFormatSpec)->for(makeField('select'))['allowed_values'])->toBe([]);
+});
+
+it('still reports enum_array for a multiple select', function (): void {
+    $spec = (new FieldFormatSpec)->for(makeField('select', [
+        'multiple' => true,
+        'options' => [['key' => 'a', 'value' => 'A']],
+    ]));
+
+    expect($spec['wire_format'])->toBe('array');
+    expect($spec['shape'])->toBe('enum_array');
+    expect($spec['allowed_values'])->toBe(['a']);
 });
 
 it('lists the icon names a client cannot otherwise discover', function (): void {
@@ -285,51 +310,26 @@ it('collects an icon set once however many fields use it', function (): void {
     rmdir($dir);
 });
 
-it('reads options written as a list of key/value maps', function (): void {
-    // What the Control Panel writes, and what selectSpec used to drop entirely.
-    $spec = (new FieldFormatSpec)->for(makeField('select', ['options' => [
-        ['key' => 'solid', 'value' => 'Solid Header'],
-        ['key' => 'transparent', 'value' => 'Transparent Header'],
-    ]]));
+it('describes the link fieldtype using the references ResolveRedirect actually understands', function (): void {
+    $spec = (new FieldFormatSpec)->for(makeField('link'));
 
-    expect($spec['allowed_values'])->toBe(['solid', 'transparent']);
+    expect($spec['wire_format'])->toBe('string');
+    expect($spec['shape'])->toBe('url_or_reference');
+
+    $rules = implode(' ', $spec['rules']);
+    expect($rules)->toContain('entry::<entry-id>');
+    expect($rules)->toContain('asset::<container>::<path>');
+    expect($rules)->toContain('@child');
+
+    expect($spec['examples'])->toContain('entry::3f2b1a44-0c6e-4c3a-9f1e-8b5d6c7a2e10');
+    expect($spec['examples'])->toContain('asset::images::brochures/2026.pdf');
 });
 
-it('reads options written as a key to label map', function (): void {
-    $spec = (new FieldFormatSpec)->for(makeField('button_group', ['options' => [
-        'grid' => 'Grid',
-        'carousel' => 'Carousel',
-    ]]));
+it('warns against the statamic:// scheme in a link field', function (): void {
+    $spec = (new FieldFormatSpec)->for(makeField('link'));
 
-    expect($spec['allowed_values'])->toBe(['grid', 'carousel']);
-});
-
-it('reads options written as a flat list', function (): void {
-    $spec = (new FieldFormatSpec)->for(makeField('radio', ['options' => ['left', 'center']]));
-
-    expect($spec['allowed_values'])->toBe(['left', 'center']);
-});
-
-it('casts non-string option keys to strings', function (): void {
-    $spec = (new FieldFormatSpec)->for(makeField('select', ['options' => [
-        ['key' => 1, 'value' => 'One'],
-        ['key' => 2, 'value' => 'Two'],
-    ]]));
-
-    expect($spec['allowed_values'])->toBe(['1', '2']);
-});
-
-it('returns no allowed values when a select has no options', function (): void {
-    expect((new FieldFormatSpec)->for(makeField('select'))['allowed_values'])->toBe([]);
-});
-
-it('still reports enum_array for a multiple select', function (): void {
-    $spec = (new FieldFormatSpec)->for(makeField('select', [
-        'multiple' => true,
-        'options' => [['key' => 'a', 'value' => 'A']],
-    ]));
-
-    expect($spec['wire_format'])->toBe('array');
-    expect($spec['shape'])->toBe('enum_array');
-    expect($spec['allowed_values'])->toBe(['a']);
+    // Bard link marks use statamic://; ResolveRedirect (the link fieldtype)
+    // does not, and stores an unresolvable value verbatim.
+    expect(implode(' ', $spec['rules']))->toContain('statamic://');
+    expect(implode(' ', $spec['common_mistakes']))->toContain('statamic://entry/<uuid>');
 });

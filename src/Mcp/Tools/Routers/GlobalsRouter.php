@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Cboxdk\StatamicMcp\Mcp\Tools\Routers;
 
 use Cboxdk\StatamicMcp\Mcp\Tools\BaseRouter;
-use Cboxdk\StatamicMcp\Mcp\Tools\Concerns\ClearsCaches;
 use Cboxdk\StatamicMcp\Mcp\Tools\Concerns\NormalizesDateFields;
 use Cboxdk\StatamicMcp\Mcp\Tools\Concerns\SanitizesFieldData;
 use Illuminate\Contracts\JsonSchema\JsonSchema as JsonSchemaContract;
@@ -22,7 +21,6 @@ use Statamic\Fields\Validator;
 #[Description('Manage Statamic global sets and their values. Use statamic-blueprints get to see field structure before updating. Actions: list, get, update.')]
 class GlobalsRouter extends BaseRouter
 {
-    use ClearsCaches;
     use NormalizesDateFields;
     use SanitizesFieldData;
 
@@ -336,7 +334,7 @@ class GlobalsRouter extends BaseRouter
             $variables->merge($data)->save();
 
             // Clear relevant caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             return [
                 'global' => [

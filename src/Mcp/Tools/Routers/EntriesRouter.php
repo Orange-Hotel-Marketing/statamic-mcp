@@ -6,7 +6,6 @@ namespace Cboxdk\StatamicMcp\Mcp\Tools\Routers;
 
 use Cboxdk\StatamicMcp\Mcp\Exceptions\FieldFormatException;
 use Cboxdk\StatamicMcp\Mcp\Tools\BaseRouter;
-use Cboxdk\StatamicMcp\Mcp\Tools\Concerns\ClearsCaches;
 use Cboxdk\StatamicMcp\Mcp\Tools\Concerns\HandlesRevisions;
 use Cboxdk\StatamicMcp\Mcp\Tools\Concerns\NormalizesDateFields;
 use Cboxdk\StatamicMcp\Mcp\Tools\Concerns\SanitizesFieldData;
@@ -32,7 +31,6 @@ use Statamic\Support\Str;
 #[Description('Manage Statamic collection entries. Use statamic-blueprints get first to understand field structure before create/update. Actions: list, get, create, update, delete, publish, unpublish, list_revisions, get_revision, restore_revision, publish_working_copy.')]
 class EntriesRouter extends BaseRouter
 {
-    use ClearsCaches;
     use HandlesRevisions;
     use NormalizesDateFields;
     use SanitizesFieldData;
@@ -425,6 +423,26 @@ class EntriesRouter extends BaseRouter
                 }
             }
 
+            // Pin the blueprint to this collection before resolving it.
+            //
+            // Entry::blueprint() memoizes into Blink under
+            // "entry-{$this->id()}-blueprint", and an unsaved entry has no id,
+            // so every new entry shares the key "entry--blueprint". A web
+            // request creates at most one entry and never notices; this server
+            // is long-lived, so the second create in a different collection was
+            // handed the first collection's blueprint, and every field the two
+            // did not share was dropped from a write that reported success (#52).
+            //
+            // Assigning the handle goes through Statamic's fluent setter, which
+            // forgets that key. The getter below then runs the normal resolution
+            // path, so EntryBlueprintFound listeners still fire and addons that
+            // inject fields keep working.
+            $collectionBlueprint = $collection->entryBlueprint();
+
+            if ($collectionBlueprint !== null) {
+                $entry->blueprint($collectionBlueprint->handle());
+            }
+
             // Get blueprint and validate field data
             $blueprint = $entry->blueprint();
 
@@ -470,9 +488,10 @@ class EntriesRouter extends BaseRouter
 
                     // Process through fieldtypes (Terms strips prefixes,
                     // Bard normalizes nodes, Relationship wraps values, etc.)
-                    $entry->data(
-                        $fields->process()->values()->except(['slug', 'date'])->all()
-                    );
+                    /** @var array<string, mixed> $processed */
+                    $processed = $fields->process()->values()->except(['slug', 'date'])->all();
+
+                    $entry->data($this->withPassthroughKeys($processed, $data, $blueprint));
                 } catch (ValidationException $e) {
                     return $this->formatValidationError($e);
                 } catch (\Throwable $e) {
@@ -493,7 +512,7 @@ class EntriesRouter extends BaseRouter
             }
 
             // Clear relevant caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             $response = [
                 'entry' => [
@@ -524,6 +543,60 @@ class EntriesRouter extends BaseRouter
             // to the client.
             return $this->createErrorResponse("Failed to create entry: {$e->getMessage()}")->toArray();
         }
+    }
+
+    /**
+     * Entry data keys Statamic reads back itself, outside the blueprint.
+     *
+     * `Entry::template()` and `Entry::layout()` both fall back to
+     * `$this->get(...)`, so a per-entry template is stored as ordinary entry
+     * data — but a blueprint need not declare a field for it, and most do not.
+     * The write pipeline runs values through
+     * `Fields::addValues()->process()->values()`, which only knows blueprint
+     * handles, so without this these keys are dropped and the write reports
+     * success having changed nothing.
+     *
+     * Deliberately a closed list: merging back every unrecognised key would
+     * reintroduce exactly the silent junk writes `reject_unknown_fields`
+     * exists to stop. `parent` is not in it — `Entry::parent()` derives from
+     * the structure tree rather than entry data, so storing it would be inert.
+     *
+     * @var array<int, string>
+     */
+    private const PASSTHROUGH_DATA_KEYS = ['template', 'layout'];
+
+    /**
+     * Carry the passthrough keys from the incoming payload into processed data.
+     *
+     * A blueprint that declares the field has already handled it through the
+     * normal pipeline, so it is left alone.
+     *
+     * @param  array<string, mixed>  $processed
+     * @param  array<string, mixed>  $incoming
+     *
+     * @return array<string, mixed>
+     *
+     * @throws FieldFormatException
+     */
+    private function withPassthroughKeys(array $processed, array $incoming, Blueprint $blueprint): array
+    {
+        foreach (self::PASSTHROUGH_DATA_KEYS as $key) {
+            if (! array_key_exists($key, $incoming) || $blueprint->hasField($key)) {
+                continue;
+            }
+
+            $value = $incoming[$key];
+
+            if ($value !== null && ! is_string($value)) {
+                throw new FieldFormatException(
+                    "Field [{$key}] must be a string or null, received " . get_debug_type($value) . '.'
+                );
+            }
+
+            $processed[$key] = $value;
+        }
+
+        return $processed;
     }
 
     /**
@@ -712,7 +785,9 @@ class EntriesRouter extends BaseRouter
                     // those nulls fail rules the field would otherwise skip.
                     $processed = $fields->process()->values()->except(['slug', 'date'])->all();
 
-                    $localization->data(array_intersect_key($processed, $data));
+                    $localization->data(
+                        $this->withPassthroughKeys(array_intersect_key($processed, $data), $data, $blueprint)
+                    );
                 } catch (ValidationException $e) {
                     return $this->formatValidationError($e);
                 } catch (\Throwable $e) {
@@ -728,7 +803,7 @@ class EntriesRouter extends BaseRouter
                 $localization->save();
             }
 
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             $response = [
                 'entry' => [
@@ -943,7 +1018,7 @@ class EntriesRouter extends BaseRouter
                     ->only($incomingKeys)
                     ->all();
 
-                $data = $processedData;
+                $data = $this->withPassthroughKeys($processedData, $data, $blueprint);
             }
 
             // Revision-aware save: if revisions enabled and entry is published,
@@ -955,7 +1030,7 @@ class EntriesRouter extends BaseRouter
             $entry->merge($data)->save();
 
             // Clear relevant caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             $response = [
                 'entry' => [
@@ -1015,7 +1090,7 @@ class EntriesRouter extends BaseRouter
             $entry->delete();
 
             // Clear relevant caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             return [
                 'entry' => $entryData,
@@ -1059,7 +1134,7 @@ class EntriesRouter extends BaseRouter
             }
 
             // Clear relevant caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             $response = [
                 'entry' => [
@@ -1114,7 +1189,7 @@ class EntriesRouter extends BaseRouter
             }
 
             // Clear relevant caches
-            $this->clearStatamicCaches(['stache', 'static']);
+            $this->clearCachesAfterWrite(['stache', 'static']);
 
             $response = [
                 'entry' => [

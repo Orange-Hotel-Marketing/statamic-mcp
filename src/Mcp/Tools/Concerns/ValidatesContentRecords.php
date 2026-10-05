@@ -12,6 +12,7 @@ use Statamic\Facades\Asset;
 use Statamic\Fields\Field;
 use Statamic\Fields\Fields;
 use Statamic\Fields\Fieldtype;
+use Statamic\Fieldtypes\Relationship;
 
 /**
  * Validates already-stored content against its blueprint.
@@ -65,6 +66,63 @@ trait ValidatesContentRecords
     }
 
     /**
+     * Wrap a scalar relationship value in the array its rules expect.
+     *
+     * A relationship field with max_items: 1 stores a bare id rather than a
+     * one-element array, so the generated `array` and `max:1` rules both failed
+     * on every correctly stored row (#58). The Control Panel never sees this
+     * because Relationship::preProcess wraps the value while building the form.
+     *
+     * Deliberately narrow. Running the whole record through preProcess() fixes
+     * the shape but launders the data along with it: Field::preProcess falls
+     * back to `defaultValue()`, so a required field that is missing or null
+     * validates clean; Integer::preProcess casts "not-a-number" to 0; a grid
+     * with min_rows invents a placeholder row; and any fieldtype that throws
+     * takes the whole record's validation down with it. Every one of those is a
+     * false negative in a sweep whose entire job is to find content that drifted.
+     *
+     * So only this one shape change is made, only where a value is actually
+     * stored. A missing key stays missing and still fails its required rule.
+     *
+     * @param  array<string, mixed>  $data
+     *
+     * @return array<string, mixed>
+     */
+    private function withWrappedRelationships(Fields $fields, array $data): array
+    {
+        foreach ($fields->all() as $handle => $field) {
+            if (! is_string($handle) || ! array_key_exists($handle, $data)) {
+                continue;
+            }
+
+            $value = $data[$handle];
+
+            if ($value === null || is_array($value)) {
+                continue;
+            }
+
+            // Only an actual id gets wrapped. Anything else is not a selected
+            // item, and wrapping it manufactures one: [''] and [false] both
+            // satisfy required, array and max:1 at once, so a relationship
+            // stored empty or corrupt would validate clean — the exact
+            // violation this sweep exists to surface.
+            if (! is_string($value) && ! is_int($value)) {
+                continue;
+            }
+
+            if (is_string($value) && trim($value) === '') {
+                continue;
+            }
+
+            if ($field instanceof Field && $field->fieldtype() instanceof Relationship) {
+                $data[$handle] = [$value];
+            }
+        }
+
+        return $data;
+    }
+
+    /**
      * Run the blueprint's real validation rules against the stored values.
      *
      * @param  array<string, mixed>  $data
@@ -74,7 +132,13 @@ trait ValidatesContentRecords
     private function ruleFindings(Fields $fields, array $data, RecordRef $record): array
     {
         try {
-            $fields->addValues($data)->validator()->validate();
+            // No preProcessValidatables() here: Validator::preProcessedFields()
+            // already calls it. Doing it twice runs each fieldtype's unwrap
+            // twice, and some are not idempotent — a code field's nested array
+            // came out flattened, so malformed content validated clean.
+            $fields->addValues($this->withWrappedRelationships($fields, $data))
+                ->validator()
+                ->validate();
 
             return [];
         } catch (ValidationException $e) {

@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Statamic addon that functions as an MCP (Model Context Protocol) server, built on top of Laravel's MCP server. The addon extends Statamic CMS v6.6+ and requires `laravel/mcp` ^0.6 || ^0.7 || ^0.8 || ^0.9 as a runtime dependency. It includes scoped API token authentication, a Vue 3 CP dashboard, and web MCP endpoints.
+This is a Statamic addon that functions as an MCP (Model Context Protocol) server, built on top of Laravel's MCP server. The addon extends Statamic CMS v6.6+ and requires `laravel/mcp` ^1.0 as a runtime dependency. It includes scoped API token authentication, a Vue 3 CP dashboard, and web MCP endpoints.
 
 ## Key Dependencies
 
 - **PHP**: ^8.3
 - **Statamic CMS**: ^6.6 (v6 only — v5 support was removed in v2.0)
 - **Laravel**: ^12.0 || ^13.0 (via Statamic v6)
-- **Laravel MCP**: ^0.6 || ^0.7 || ^0.8 || ^0.9 (required - must be in `require` section, not `require-dev`)
+- **Laravel MCP**: ^1.0 (required - must be in `require` section, not `require-dev`)
 - **Orchestra Testbench**: ^10.0 || ^11.0 (dev dependency for testing)
 - **Pest**: ^4.1 (stable release with PHP 8.3 requirement)
 - **Symfony YAML**: ^7.0 || ^8.0 (for YAML processing)
@@ -228,9 +228,9 @@ The main entry point is `src/ServiceProvider.php` which extends `Statamic\Provid
 ### Addon Registration
 The addon is registered through Laravel's service provider discovery mechanism via the `extra.laravel.providers` configuration in `composer.json`.
 
-## Laravel MCP v0.6+ Tool Development Guide
+## Laravel MCP v1.0 Tool Development Guide
 
-**CRITICAL**: This project uses Laravel MCP v0.6+ which has specific patterns that MUST be followed exactly.
+**CRITICAL**: This project uses Laravel MCP v1.0 which has specific patterns that MUST be followed exactly.
 
 ### Required Tool Structure
 
@@ -277,7 +277,7 @@ class ExampleTool extends BaseStatamicTool
 }
 ```
 
-### Key Differences from v0.2.0
+### Key Differences from the pre-1.0 API
 
 - **Attributes instead of methods**: Use `#[Name('...')]` and `#[Description('...')]` instead of `getToolName()`/`getToolDescription()`
 - **Tool extends Primitive**: `Tool` base class provides `name()` and `description()` via attributes or string properties
@@ -718,8 +718,109 @@ class StatamicExportStrategy extends BaseStatamicTool
 - `statamic-system-discover` - Intent-based tool discovery
 - `statamic-system-schema` - Tool schema inspection
 
+Note: only `statamic-system-discover`, `statamic-entries` and `statamic-blueprints` are
+listed in the catalog by default. See "The tool catalog is deliberately partial" below.
+
 #### Workflow Facades
 - `statamic-content-facade` - Common content workflows
+
+### The tool catalog is deliberately partial
+
+`tools/list` costs every client ~31 KB of schema on every connection, before it has
+asked anything — the routers carry large schemas and there are eleven of them. So
+`StatamicMcpServer` splits them:
+
+- **`CORE_TOOLS`** stay in the catalog: `statamic-system-discover`, `statamic-entries`,
+  `statamic-blueprints`. They cover what a session actually opens with.
+- **`SEARCHABLE_TOOLS`** are handed to `Laravel\Mcp\Server\Tools\ToolSearch`, which
+  exposes them through `search_tools` and `execute_tools` instead. Catalog drops to
+  ~12.6 KB, a ~60% cut.
+
+**This does not weaken authorization.** ToolSearch honours `shouldRegister()`, so a
+disabled domain stays invisible, and `execute_tools` invokes the tool's own `handle()`
+— token scope, resource policy, Statamic permissions and the confirmation gate all
+apply exactly as on a direct call. A searchable tool is hidden, never ungated.
+
+Two consequences worth knowing:
+
+- `execute_tools` yields progress notifications before its result, so the endpoint
+  answers as an **SSE stream**, not a single JSON body. Tests must read
+  `streamedContent()` and parse `data:` frames.
+- The split is config-driven (`catalog.searchable`, default true) because some
+  clients handle `search_tools` badly. `createContext()` — not `boot()`, not a property
+  initializer — resolves both the catalog and the instructions describing it, so the
+  two can never disagree. **If you change the split, the instructions must change with
+  it**: an agent told to use `search_tools` when it is off will simply fail.
+
+`DiscoveryTool` reads `StatamicMcpServer::CORE_TOOLS` to tell clients whether a
+recommended tool is `listed_in_catalog` or reachable `via_execute_tools`. Do not restate
+the split there — it must stay derived, or the two drift.
+
+### CORS and the preflight route
+
+`Mcp::web()` registers GET, DELETE and POST — **not OPTIONS**. The addon therefore
+registers its own OPTIONS route alongside it in `registerWebMcp()`. Without it a
+preflight 404s before reaching `HandleMcpCors`, so its preflight branch never runs and
+no cross-origin browser client can connect — `Authorization` alone already triggers a
+preflight, so this was broken for every browser client, not only 1.0 ones.
+
+That route sits **outside** the auth stack on purpose: a preflight carries no
+credentials, and answering 401 fails it exactly as surely as 404 did.
+
+`HandleMcpCors` is attached as **group** middleware wrapping `Mcp::web()`, not as route
+middleware on it. `Mcp::web()` attaches `ValidateMcpHeaders` to the route itself, and
+route middleware appended afterwards runs *after* it — a `-32020` rejection would then
+carry no `Access-Control-Allow-Origin`, and the browser would hide both the 400 and its
+explanation behind a generic network error. Group middleware runs first, which puts CORS
+outermost. **Keep it there.**
+
+`HandleMcpCors::ALLOWED_HEADERS` must list every header a client is required to send.
+Since protocol 2026-07-28 that includes `MCP-Protocol-Version`, `Mcp-Method` and
+`Mcp-Name` — a browser is blocked if it sends a header the preflight did not allow, and
+`ValidateMcpHeaders` answers `-32020` if it omits one. **Any new required header must be
+added here too.**
+
+### The execute_tools response budget
+
+`ToolSearch` enforces its own output cap from `mcp.tool_search.max_output_bytes`
+(library default 65,536), unrelated to this addon's `security.max_response_size`
+(default 100,000). It also measures each result as `{content, structuredContent}`, and
+our tools populate both with the same envelope, so a payload counts roughly twice.
+
+Left alone, a response the addon returns happily on a direct call comes back as
+`OutputLimitExceeded` the moment its tool moves behind the searchable catalog — and
+raising `max_response_size` does not help, because it is a different key.
+
+`ServiceProvider::alignToolSearchOutputBudget()` therefore derives the library's value
+from ours: `ceiling * 3 + 4096`, or `PHP_INT_MAX` when the ceiling is disabled. A value
+an operator set themselves is left alone; only the library's untouched default is
+replaced. The decision lives in the pure `toolSearchOutputBudget()` so it can be tested
+without re-registering the provider.
+
+**Three, not two** — this is the part that is easy to get wrong. `structuredContent`
+holds the envelope and `content[0].text` holds the *same envelope already serialized*,
+so encoding the entry escapes every quote and backslash in it a second time. A
+quote-heavy 84 KB envelope measures 180 KB: a ratio of 2.14, and worse the more
+structured the content. Escaping can at most double the text copy, so `ceiling +
+2 * ceiling` bounds one maximum-size response by construction rather than by
+measurement.
+
+### Cache hints
+
+laravel/mcp 1.0 lets a response tell the client how long it may be reused
+(`Cacheable` attribute, `cacheHints()`). What this server hints:
+
+- `server/discover`, `tools/list`, `prompts/list` — 5 min. Derived from config, so they
+  change on deploy, not during a session.
+- The blueprint resources — 1 min, via `#[Cacheable]` on the resource class. Short on
+  purpose: this addon can edit a blueprint, and an agent holding a stale schema across
+  its own edit is the one failure the hint could cause.
+- Everything else is left at the library default of "do not cache". **Tool calls are
+  never cacheable** — that is what keeps content reads fresh.
+
+**Scope is `private` everywhere, and must stay that way.** These responses are filtered
+by the caller's token scope, resource policy and Statamic permissions, so a shared cache
+could otherwise hand one caller's view to another.
 
 ### Benefits of Router Architecture:
 1. **Scalability**: Easy to add new actions without new tools
@@ -733,7 +834,51 @@ class StatamicExportStrategy extends BaseStatamicTool
 
 **`statamic-blueprints`** — list, get, create, update, delete, scan, generate, types, validate
 
-**`statamic-entries`** — list, get, create, update, delete, publish, unpublish
+`get` accepts a `field` dot path (`page_builder.ContentSection.media`) that scopes the
+response to one field or set. A page builder's format spec is proportional to every set
+it can hold, so the full response on a real blueprint can exceed the response size limit
+at any useful depth; scoping is how a client reaches a deep spec at all. An unresolvable
+path lists the valid segments at the level it failed.
+
+**`statamic-entries`** — list, get, create, update, localize, delete, publish, unpublish,
+list_revisions, get_revision, restore_revision, publish_working_copy
+
+`update` accepts `merge_sets`: when true, a top-level replicator field in `data` is merged
+into the stored array by item `id` rather than replacing it, so one section of a page
+builder can change without resending the rest. Every item sent must carry an `id`;
+removing and reordering still require a full-array write.
+
+**Resolving a blueprint from an unsaved object.** Statamic memoizes resolved
+blueprints in Blink, keyed by the object's identity — `entry-{$id}-blueprint`,
+`term-{$id}-blueprint`, `globals-blueprint-{$handle}-{$locale}`,
+`nav-blueprint-{$handle}`. An **unsaved entry has no id**, so every new entry
+shares the key `entry--blueprint`. A web request creates at most one entry and
+never notices; this server is long-lived, so a second `create` in a different
+collection was handed the first collection's blueprint and silently dropped every
+field the two did not share (#52).
+
+`createEntry()` therefore pins the handle — `$entry->blueprint($handle)` — before
+reading it. Go through the fluent setter, which calls `Blink::forget($key)`;
+resolving straight from the collection would skip the getter and with it the
+`EntryBlueprintFound` event, so addon-injected fields would be filtered out
+instead — the same bug one layer down. **Any new code path that resolves a
+blueprint from an object that is not yet saved needs the same treatment.** Terms,
+globals and navs are safe today only because their keys carry a handle that is
+already set.
+
+`template` and `layout` are entry **data**, not entry properties: `Entry::template()`
+and `Entry::layout()` fall back to `$this->get(...)`, and `fileData()` persists only
+`data()`. They need not be blueprint fields, so `EntriesRouter::PASSTHROUGH_DATA_KEYS`
+carries them through the `process()->values()` step, which would otherwise drop them.
+Keep that list closed — carrying every unrecognised key back would reintroduce the
+silent junk writes `reject_unknown_fields` prevents. `parent` is deliberately excluded:
+`Entry::parent()` derives from the structure tree, so storing it as data is inert.
+
+`localize` creates an entry's localization in another site via Statamic's
+`makeLocalization()`, so the origin is set and untranslated fields keep falling back. It
+is a **write** action — it appears in the write lists in both `EnforcesResourcePolicy`
+and `RouterHelpers`, which is what makes it require `entries:write` and a write-mode
+resource policy check. Any new write action must be added to both.
 
 **`statamic-terms`** — list, get, create, update, delete
 
@@ -762,6 +907,23 @@ trees are additionally checked for menu items pointing at deleted entries.
 
 **`statamic-system-schema`** — inspect full JSON schema of any registered tool
 
+## Extending fieldtypes
+
+`src/Mcp/Support/FieldtypeExtensions.php` is a static registry letting a site or addon
+teach the server about a fieldtype this package does not ship support for. An unknown
+fieldtype otherwise gets no wire-format guidance and no input coercion, so a client
+guesses at the shape and the guess reaches a `process()` written for Control Panel input.
+
+- `FieldtypeExtensions::spec($handle, fn (Field $field) => [...])` supplies the
+  `_format_spec` a blueprint `get` reports for that fieldtype.
+- `FieldtypeExtensions::sanitizer($handle, fn (mixed $v, Field $f, string $path) => ...)`
+  coerces or rejects an incoming value before validation and before the fieldtype's own
+  `process()`. Throw `FieldFormatException` to reject, and include `$path` in the message.
+
+Both are keyed by fieldtype handle; a later registration replaces an earlier one. The
+registry is static, so tests that register must `flush()` in setUp and tearDown. Register
+from a service provider's `boot()`. Documented for users in `docs/extending/fieldtypes.md`.
+
 ## MCP Resources
 
 Beyond tools, the server exposes read-only resources (`src/Mcp/Resources/`):
@@ -787,6 +949,97 @@ delivery, response serialization, and the `isError` flag. This works only becaus
 Testbench does not run package auto-discovery, and without that provider
 `Laravel\Mcp\Request` receives no arguments, so protocol tests pass while asserting
 nothing. Do not remove it.
+
+`tests/Feature/WebEndpointProtocolTest.php` covers the other half: the endpoint driven
+the way a real client drives it, over HTTP, through the full middleware stack (CORS,
+transport check, bearer auth, throttle, permission gate) and through laravel/mcp 1.0's
+`ValidateMcpHeaders`.
+
+That layer had no coverage before 1.0, which is how an entire protocol change could have
+broken every client while the suite stayed green. A 1.0 request body carries its protocol
+version and client capabilities in `params._meta`, and POSTs must send `MCP-Protocol-Version`
+and `Mcp-Method` headers matching the body — plus `Mcp-Name` for `tools/call`, `prompts/get`
+and `resources/read`. A mismatch is HTTP 400 with JSON-RPC error `-32020`. The test's `rpc()`
+helper builds all of that; use it rather than hand-rolling a request.
+
+Legacy `initialize` clients (2025-06-18, 2025-11-25) still connect and skip header
+validation entirely. There is a test pinning that, because it is the compatibility
+promise most likely to be broken by accident.
+
+## Cache clearing is deferred, not removed
+
+A write asks for a cache clear; `BaseStatamicTool::execute()` runs it in a `finally`,
+once the call is over. Both halves of that matter.
+
+**It still clears**, because Statamic does not rebuild the indexes that *depend* on a
+write: a changed `max_items` leaves an index whose shape later throws, a changed mount
+leaves every entry 404ing, a removed taxonomy leaves `whereTaxonomy()` returning entries,
+a group's roles leave its members' role indexes stale. Repeated passes over the code kept
+turning up more — the set is not enumerable, so do not try to replace the clear with a
+list of special cases. That was tried and abandoned.
+
+**It clears late**, because clearing mid-call is what broke a live site (#53).
+`statamic:stache:clear` goes through Artisan and resets the in-memory stores immediately,
+so the rest of the call reads emptied stores — a structured collection's tree came back
+empty, Statamic padded it with every entry at root, and a random entry became the
+homepage. By the time the `finally` runs, the response is built and nothing further reads
+Statamic.
+
+So: **queue with `clearCachesAfterWrite()`, never call `clearStatamicCaches()` from a
+write path.** The immediate version exists for the system router's `cache_clear` action,
+where the caller asked for it. There is a test asserting no clear lands while a call is
+in progress; it fails the moment anything clears inline.
+
+## Blink is per-request; this server is not
+
+Statamic's `Blink` cache is scoped to one web request and filled freely on that
+assumption — the request ends, the cache goes away. This server is long-lived, so
+without intervention every tool call inherits whatever the last one memoized and
+answers with state that was true several calls ago.
+
+`BaseStatamicTool::execute()` therefore flushes Blink at the start of every call. That
+is the single seam every tool goes through, and it makes each call begin the way a fresh
+request would. Nothing durable is lost: Blink holds only what can be read again.
+
+This is not hygiene, it is correctness. Three separate bugs were this cache:
+
+- A structured collection's tree is blinked, so the second `create` in a session saw a
+  tree predating the first entry and Statamic saved it with **`uri: null`** — the entry
+  existed, `findByUri()` missed it, the page 404'd.
+- Deleting an entry left blinked term associations behind, so `entriesCount()` kept
+  counting it and orphaned terms stayed in listings.
+- The unsaved-entry blueprint collision in #52, one layer down, documented above.
+
+Clearing the Stache also masked all of these, which is why they only surfaced when that
+clear was removed for #53. **Do not reach for a Stache clear to fix a stale read** — it
+resets durable stores mid-request, which is what emptied a live site's collection tree.
+Ask first whether the stale value came from Blink.
+
+## Measuring performance invariants in tests
+
+`tests/Stress/LargeDatasetTest.php` guards the token store against going quadratic.
+Two rules came out of it failing at random for months:
+
+**Never assert on wall-clock.** It measures the machine, not the algorithm. The same
+operations were seen swinging from 6 ms to 710 ms for identical work under load, with a
+50-token prune timing *slower* than a 500-token one. Use CPU time (`getrusage()`, user +
+system) — a competing process cannot inflate it. Under load average 112 it held within
+~5% where wall-clock varied 100x. And watch the floor: a `max($small, 0.01)` guard turns
+a scaling comparison into an absolute deadline the moment the small run drops below it,
+which is exactly how these tests started failing on busy machines.
+
+**Timing cannot see a small term inside a large one.** Reintroducing the quadratic index
+rewrite moved the measured ratio only from 1.35x to 2.12x, because scanning and unlinking
+N token files is linear work in both implementations and dwarfs the index writes. A test
+that cannot fail is worse than one that fails at random — it reports safety it does not
+provide.
+
+Where an invariant is countable, **count it**. `CountingStreamWrapper`
+(`tests/Support/CountingStreamWrapper.php`) proxies filesystem calls and tallies writes
+per file, so "pruning a batch rewrites the index once, not once per token" is asserted
+exactly: the reintroduced bug takes that count from 1 to 50, with no timing involved.
+Note this is why `FileTokenStore` scans with `scandir()` rather than `glob()` — `glob()`
+bypasses stream wrappers and silently returns nothing under a wrapped path.
 
 ## Production-Ready Features
 
@@ -831,17 +1084,25 @@ nothing. Do not remove it.
 - Validation against blueprint field definitions
 
 ### Automatic Cache Purging
-All structural and content changes automatically clear relevant caches:
-- **Blueprint changes**: Clears stache, static, views
-- **Content changes**: Clears stache, static
-- **Structure changes**: Clears stache, static, views
-- **Global changes**: Clears stache with targeted cache invalidation
-- **Response includes cache status** for transparency
+Writes queue a clear of what their change invalidates. Content and structure writes that
+can change a rendered page — entries, terms, collections, taxonomies, navigations, global
+sets, revisions — queue **stache + static**. Writes that cannot — blueprints, assets,
+users, roles, groups — queue **stache** only, since Statamic's own invalidator already
+subscribes to `BlueprintSaved` and `AssetSaved`. Collection writes additionally invalidate
+their own static URLs directly, because `CollectionSaved` is not in that subscriber list.
+
+**The clear is deferred**, and that matters more than the list above: see
+"Cache clearing is deferred, not removed". It runs once the response is built, never
+mid-call. Queue it with `clearCachesAfterWrite()`; `clearStatamicCaches()` is the
+immediate version and belongs only to the system router's `cache_clear` action.
+
+The result is not reported in the response — it is not known until after the envelope is
+assembled, and a cache rebuild is not something the caller acts on.
 
 ### Performance Optimizations
 - **Pagination support** in all content extraction tools
 - **Field filtering** in blueprint scanning (`include_fields: false`)
-- **Response size limits** to prevent token overflow (< 25,000 tokens)
+- **Response size limits** to prevent token overflow (`security.max_response_size`, 100,000 bytes by default)
 - **Intelligent defaults** for large datasets
 - **Optimized Site validation** using `Site::all()->map->handle()->contains()`
 - **Collection handle caching** with `Collection::handles()->all()`
@@ -1110,3 +1371,13 @@ The addon supports configuration via `config/statamic/mcp.php` for:
 - Storage paths for tokens, audit, and OAuth data
 - Tool env toggles (`STATAMIC_MCP_TOOL_{NAME}_ENABLED`)
 - Git automation events for token operations
+- `security.max_response_size` — response ceiling in bytes (default 100000, `0` disables).
+  Guards the client's context window, not the server; the response is already built when
+  it is measured.
+- `security.reject_unknown_fields` — refuse writes carrying keys that are not field
+  handles **inside a replicator set, grid row, bard set or group** (default true).
+  Deliberately not applied at the top level of a record: an entry legitimately carries
+  keys that are not blueprint fields (`template` and `layout` are read back by
+  `Entry::template()`/`Entry::layout()`, `parent` backs structures), and no allowlist can
+  enumerate what every addon adds. `ValidatesContentRecords` scopes its equivalent check
+  the same way, for the same reason.
